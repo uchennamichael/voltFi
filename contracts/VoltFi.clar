@@ -179,6 +179,16 @@
   })
 )
 
+(define-private (log-collateral-withdrawal (user principal) (amount uint) (remaining-collateral uint))
+  (print {
+    event: "collateral-withdrawal",
+    user: user,
+    amount: amount,
+    remaining-collateral: remaining-collateral,
+    block-height: stacks-block-height
+  })
+)
+
 (define-private (log-borrow (user principal) (amount uint) (new-debt uint) (ltv uint))
   (print {
     event: "borrow",
@@ -338,6 +348,54 @@
                      debt: (get debt position) })
           (log-collateral-deposit sender amount new-collateral)
           (ok amount)
+        )
+      )
+    )
+  )
+)
+
+(define-public (withdraw-collateral (amount uint))
+  (let ((sender tx-sender)
+        (position (default-to { collateral: u0, debt: u0 }
+                              (map-get? positions { user: sender }))))
+    (try! (check-not-paused))
+    ;; Input validation
+    (if (or (is-eq amount u0) (> amount MAX-AMOUNT))
+      (err u614) ;; Invalid withdrawal amount
+      (let (
+        (current-collateral (get collateral position))
+        (current-debt (get debt position))
+      )
+        (if (> amount current-collateral)
+          (err u615) ;; Insufficient collateral
+          (let ((remaining-collateral (- current-collateral amount)))
+            ;; If user has debt, check that remaining collateral maintains safe LTV
+            (if (> current-debt u0)
+              (match (get-ltv remaining-collateral current-debt)
+                ltv
+                  (if (<= ltv MAX-LTV)
+                    (begin
+                      ;; Safe to withdraw - update position and transfer
+                      (try! (as-contract (stx-transfer? amount (as-contract tx-sender) sender)))
+                      (map-set positions { user: sender }
+                               { collateral: remaining-collateral, debt: current-debt })
+                      (log-collateral-withdrawal sender amount remaining-collateral)
+                      (ok amount)
+                    )
+                    (err u616) ;; Would exceed max LTV
+                  )
+                err (err err)
+              )
+              ;; No debt - can withdraw freely
+              (begin
+                (try! (as-contract (stx-transfer? amount (as-contract tx-sender) sender)))
+                (map-set positions { user: sender }
+                         { collateral: remaining-collateral, debt: current-debt })
+                (log-collateral-withdrawal sender amount remaining-collateral)
+                (ok amount)
+              )
+            )
+          )
         )
       )
     )
@@ -511,6 +569,36 @@
               )
             )
           err (err err)
+        )
+      )
+    (ok u0)
+  )
+)
+
+(define-read-only (get-max-withdrawable-collateral (user principal))
+  (match (map-get? positions { user: user })
+    position
+      (let (
+        (collateral (get collateral position))
+        (debt (get debt position))
+      )
+        (if (is-eq debt u0)
+          ;; No debt - can withdraw all collateral
+          (ok collateral)
+          ;; Has debt - calculate max withdrawable while maintaining MAX-LTV
+          (match (get-price 0x535458) ;; "STX"
+            price
+              (let (
+                (debt-value debt)
+                (min-collateral-needed (/ (* debt-value u100) (* price MAX-LTV)))
+              )
+                (if (> collateral min-collateral-needed)
+                  (ok (- collateral min-collateral-needed))
+                  (ok u0)
+                )
+              )
+            err (err err)
+          )
         )
       )
     (ok u0)
